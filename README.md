@@ -150,6 +150,49 @@ PUBLIC_BASE_URL=https://your-ngrok-url.ngrok-free.dev  # updates every time ngro
 
 ---
 
+## Fresh Machine Setup (First Time Only)
+
+Do this once, when setting up the project on a new machine. After this, use the [Running the Project](#running-the-project) section every time.
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/Kshaf-Fatima/Multi-tenant-AI-receptionist-platform.git
+cd Multi-tenant-AI-receptionist-platform
+```
+
+### 2. Set up the backend (Python)
+```bash
+cd backend
+python -m venv venv
+
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+### 3. Create your `.env` file
+```bash
+# Windows:
+copy .env.example .env
+# macOS/Linux:
+cp .env.example .env
+```
+Then open `backend/.env` and fill in your own real values — API keys for Twilio, Deepgram, Groq, ElevenLabs, and a JWT secret (see [Environment Variables](#environment-variables) for the full list and what each one is for). None of these are provided in the repo — they're personal/account-specific and must never be committed to git.
+
+### 4. Set up the frontend (Node)
+```bash
+cd ../admin-console
+npm install
+```
+
+### 5. Set up Docker containers (Postgres & Qdrant)
+See [Docker (Postgres & Qdrant)](#docker-postgres--qdrant) below — the "first-time setup" commands create the containers; you only need to do this once per machine.
+
+Once all five steps are done, follow [Running the Project](#running-the-project) to start everything.
+
 ## Running the Project
 
 Every process below runs in its **own terminal window** and must be left running.
