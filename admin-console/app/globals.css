@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+:root {
+  /* Warm, front-desk-inspired palette — not a generic blue SaaS dashboard */
+  --paper: #FAF6EF;         /* warm neutral background */
+  --ink: #24211C;           /* warm near-black, primary text */
+  --ink-soft: #6B6558;      /* muted warm gray, secondary text */
+  --teal-deep: #1F4B43;     /* primary brand — sidebar, headers */
+  --teal-mid: #2F6E62;      /* hover / secondary teal */
+  --brass: #C08A3E;         /* accent — CTAs, active states */
+  --brass-light: #E9D3AC;   /* light accent — badges, highlights */
+  --line: #E4DDCC;          /* hairline dividers */
+  --danger: #B4432F;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-teal-deep: var(--teal-deep);
+  --color-teal-mid: var(--teal-mid);
+  --color-brass: var(--brass);
+  --color-brass-light: var(--brass-light);
+  --color-line: var(--line);
+  --color-danger: var(--danger);
+  --font-display: var(--font-fraunces);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-plex-mono);
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}

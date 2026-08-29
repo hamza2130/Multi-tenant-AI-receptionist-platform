@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<!--
+  widget_combined.html — a single interface offering both channels:
+  text chat (same /chat endpoint as widget.html) and browser-based
+  voice calling (same /token + Twilio Voice SDK pattern used in the
+  original voice receptionist project's browser_call.html).
+
+  This exists as a testing/demo tool for a single tenant, ahead of
+  Week 3's real Admin Console, which will eventually offer this same
+  "test in sandbox" experience per business, without manual config.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AI Receptionist — Chat & Call</title>
+<script src="https://cdn.jsdelivr.net/npm/@twilio/voice-sdk@2.18.3/dist/twilio.min.js"></script>
+<style>
+html, body {
+    background: transparent;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #e2e8f0;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    position: relative;
+  }
+.card {
+    background: #1e293b;
+    border-radius: 16px;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    overflow: hidden;
+    display: none; /* hidden until the bubble is clicked */
+  }
+  .card.open { display: block; }
+
+  #launcher-btn {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: #2563eb;
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    font-size: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .header {
+    background: #2563eb;
+    padding: 18px;
+    text-align: center;
+  }
+  .header h1 { margin: 0; font-size: 18px; }
+
+  .tabs { display: flex; background: #0f172a; }
+  .tab {
+    flex: 1; padding: 12px; text-align: center; cursor: pointer;
+    font-size: 14px; font-weight: 600; color: #94a3b8;
+    border-bottom: 3px solid transparent;
+  }
+  .tab.active { color: #fff; border-bottom-color: #2563eb; }
+
+  .panel { display: none; padding: 16px; }
+  .panel.active { display: block; }
+
+  /* Chat panel */
+  #chat-messages { height: 320px; overflow-y: auto; margin-bottom: 10px; }
+  .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 10px; max-width: 80%; font-size: 14px; }
+  .msg.user { background: #2563eb; color: white; margin-left: auto; }
+  .msg.bot { background: #334155; color: #e2e8f0; }
+  #chat-input-row { display: flex; gap: 6px; }
+  #chat-input { flex: 1; border: none; border-radius: 8px; padding: 10px; font-size: 14px; }
+  #chat-send { border: none; background: #2563eb; color: white; padding: 0 16px; border-radius: 8px; cursor: pointer; }
+
+  /* Call panel */
+  #call-panel { text-align: center; padding: 30px 16px; }
+  #call-panel p { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+  button.call-btn {
+    font-size: 15px; padding: 12px 28px; border-radius: 999px; border: none;
+    cursor: pointer; font-weight: 600;
+  }
+  #callBtn { background: #22c55e; color: white; }
+  #hangupBtn { background: #ef4444; color: white; display: none; }
+  #call-status { margin-top: 16px; font-size: 13px; color: #64748b; }
+</style>
+</head>
+<body>
+
+<button id="launcher-btn" onclick="toggleWidget()">💬</button>
+
+<div class="card" id="widget-card">
+  <div class="header"><h1>🎙️ AI Receptionist</h1></div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="chat">💬 Chat</div>
+    <div class="tab" data-tab="call">📞 Call</div>
+  </div>
+
+  <div class="panel active" id="chat-panel">
+    <div id="chat-messages"></div>
+    <div id="chat-input-row">
+      <input id="chat-input" type="text" placeholder="Type a message...">
+      <button id="chat-send">Send</button>
+    </div>
+  </div>
+
+  <div class="panel" id="call-panel">
+    <p>Talk to the receptionist directly through your browser — no phone needed.</p>
+    <button id="callBtn" class="call-btn" disabled>Loading...</button>
+    <button id="hangupBtn" class="call-btn">Hang Up</button>
+    <div id="call-status">Connecting...</div>
+  </div>
+</div>
+
+<script>
+ // --- Config — API key is read from the URL (?api_key=...), so this
+  // one file can be used to test/serve any tenant without editing code.
+  // Example: widget_combined.html?api_key=sk_tenant_XXXX
+  const API_BASE = "http://localhost:8000";   // main.py (chat + token)
+  const urlParams = new URLSearchParams(window.location.search);
+  const TENANT_API_KEY = urlParams.get("api_key");
+
+  if (!TENANT_API_KEY) {
+    document.body.innerHTML = `
+      <div style="color:#e2e8f0; font-family:sans-serif; text-align:center; padding:40px;">
+        <h2>Missing API key</h2>
+        <p>Open this page with <code>?api_key=YOUR_TENANT_KEY</code> in the URL.</p>
+      </div>`;
+    throw new Error("No API key provided in URL");
+  }
+  // ---------------------------------------------------------
+
+  // Tab switching
+ // Launcher toggle — bubble <-> expanded card
+  function toggleWidget() {
+    const card = document.getElementById("widget-card");
+    const btn = document.getElementById("launcher-btn");
+    const isOpen = card.classList.toggle("open");
+    btn.textContent = isOpen ? "✕" : "💬";
+  }
+
+  // Tab switching
+  document.querySelectorAll(".tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+      tab.classList.add("active");
+      document.getElementById(tab.dataset.tab + "-panel").classList.add("active");
+    });
+  });
+
+  // ---------- Chat ----------
+  let conversationId = null;
+  const messagesEl = document.getElementById("chat-messages");
+  const input = document.getElementById("chat-input");
+
+  function addMessage(text, sender) {
+    const div = document.createElement("div");
+    div.className = `msg ${sender}`;
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const text = input.value.trim();
+    if (!text) return;
+    addMessage(text, "user");
+    input.value = "";
+    try {
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": TENANT_API_KEY },
+        body: JSON.stringify({ message: text, conversation_id: conversationId }),
+      });
+      const data = await res.json();
+      conversationId = data.conversation_id;
+      addMessage(data.answer, "bot");
+    } catch (err) {
+      addMessage("Sorry, something went wrong connecting to the receptionist.", "bot");
+    }
+  }
+  document.getElementById("chat-send").addEventListener("click", sendMessage);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+
+  // ---------- Call ----------
+  let device, activeCall;
+  const callBtn = document.getElementById("callBtn");
+  const hangupBtn = document.getElementById("hangupBtn");
+  const statusEl = document.getElementById("call-status");
+
+  async function setupCalling() {
+    try {
+      const res = await fetch(`${API_BASE}/token`);
+      const data = await res.json();
+      device = new Twilio.Device(data.token, { logLevel: 1 });
+
+      device.on("registered", () => {
+        statusEl.textContent = "Ready to call.";
+        callBtn.disabled = false;
+        callBtn.textContent = "📞 Call Receptionist";
+      });
+      device.on("error", (err) => { statusEl.textContent = "Error: " + err.message; });
+      await device.register();
+    } catch (err) {
+      statusEl.textContent = "Setup failed: " + err.message;
+    }
+  }
+
+ callBtn.addEventListener("click", async () => {
+    console.log("[DEBUG] Attempting call with TENANT_API_KEY:", TENANT_API_KEY);
+    statusEl.textContent = "Calling...";
+    callBtn.style.display = "none";
+    activeCall = await device.connect({ params: { tenant_api_key: TENANT_API_KEY } });
+    activeCall.on("accept", () => {
+      statusEl.textContent = "Connected — say something!";
+      hangupBtn.style.display = "inline-block";
+    });
+    activeCall.on("disconnect", () => {
+      statusEl.textContent = "Call ended.";
+      hangupBtn.style.display = "none";
+      callBtn.style.display = "inline-block";
+    });
+  });
+  hangupBtn.addEventListener("click", () => { if (activeCall) activeCall.disconnect(); });
+
+  setupCalling();
+</script>
+
+</body>
+</html>

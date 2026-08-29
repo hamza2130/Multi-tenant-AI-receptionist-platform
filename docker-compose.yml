@@ -1,0 +1,36 @@
+version: "3.8"
+
+# Week 1 infra: Postgres (tenant config, bookings, leads, logs)
+# and Qdrant (per-tenant vector collections for RAG).
+#
+# Run with: docker-compose up -d
+# Stop with: docker-compose down
+# Wipe data and start fresh: docker-compose down -v
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: receptionist_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: receptionist
+      POSTGRES_PASSWORD: receptionist_dev_password
+      POSTGRES_DB: receptionist_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: receptionist_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  qdrant_data:

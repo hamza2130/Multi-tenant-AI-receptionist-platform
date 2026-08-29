@@ -1,0 +1,51 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-dotenv==1.0.1
+pydantic>=2.10.6,<3.0.0
+pydantic-settings==2.6.0
+ 
+# Database
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+ 
+# Vector DB
+qdrant-client==1.12.1
+ 
+# Embeddings — runs locally, no API key needed
+sentence-transformers==3.3.1
+ 
+# LLM client (provider-swappable — starting with Groq)
+groq==0.9.0
+ 
+# Text chunking / document handling
+pypdf==5.1.0
+beautifulsoup4==4.12.3
+requests==2.32.3
+ 
+# Voice pipeline (Week 2) — Pipecat orchestrates VAD -> STT -> LLM -> TTS
+# in real time over Twilio Media Streams (WebSocket), replacing the old
+# record-then-fetch pattern from the voice receptionist project.
+pipecat-ai[silero,deepgram,elevenlabs,openai]==1.6.0
+websockets>=12.0
+ 
+# Standalone ElevenLabs SDK — used directly by test_tts_output.py.
+# Note: Pipecat's own TTS service does NOT depend on this package (it
+# implements ElevenLabs calls internally), so it has to be added
+# separately for our own standalone test script to work.
+elevenlabs==2.58.0
+ 
+# Standalone Twilio SDK — used directly by call_logging.py to call
+# Twilio's REST API (starting call recordings). Note: Pipecat's
+# TwilioFrameSerializer handles the live Media Stream protocol itself
+# and does NOT depend on this package, so it's added separately here,
+# same pattern as elevenlabs above.
+twilio==9.2.3
+
+python-multipart==0.0.32
+ 
+
+bcrypt==4.2.0
+python-jose[cryptography]==3.3.0
+
+tzdata==2026.3

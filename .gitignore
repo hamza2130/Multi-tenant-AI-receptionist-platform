@@ -1,0 +1,44 @@
+# ==================== Environment / Secrets ====================
+# Never commit real API keys or credentials
+backend/.env
+admin-console/.env.local
+admin-console/.env
+.env
+*.env
+
+# ==================== Python (backend/) ====================
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# ==================== Node / Next.js (admin-console/) ====================
+admin-console/node_modules/
+admin-console/.next/
+admin-console/out/
+admin-console/.turbo/
+node_modules/
+.next/
+
+# ==================== Logs ====================
+*.log
+npm-debug.log*
+
+# ==================== OS / Editor files ====================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ==================== Docker ====================
+# (docker-compose.yml itself should stay tracked — only ignore
+# any local override files or volume data if present)
+docker-compose.override.yml
+
+# ==================== Misc project-specific ====================
+# Test/demo artifacts not part of the actual product
+dummy_site/*.log
