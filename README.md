@@ -184,8 +184,8 @@ Then open `backend/.env` and fill in your own real values — API keys for Twili
 
 ### 4. Set up the frontend (Node)
 ```bash
-cd ../admin-console
-npm install
+cd admin-console
+npm run dev
 ```
 
 ### 5. Set up Docker containers (Postgres & Qdrant)
