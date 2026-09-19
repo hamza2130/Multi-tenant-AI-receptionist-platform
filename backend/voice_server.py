@@ -31,9 +31,8 @@ from config import settings
 from database import SessionLocal
 from models import Tenant, Conversation, Channel, Config, Document, KnowledgeSource
 import auth
-import skills
 from call_logging import start_call_recording, save_transcript, close_conversation
-from agent import _format_settings
+from agent import AGENT_TOOLS, _execute_tool, _format_settings
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
@@ -135,65 +134,25 @@ async def run_receptionist(
     settings_section = _format_settings(config)
     knowledge_context = _knowledge_context(db, tenant.id)
 
-    # Register the same four skills as the text channel (agent.py),
-    # so booking/leads/messages/escalation behave identically on
-    # both channels.
-    async def _make_handler(skill_fn):
-        async def handler(params):
-            result = skill_fn(db, tenant.id, conversation.id, **params.arguments)
-            await params.result_callback(result)
-        return handler
-
-    llm.register_function("book_appointment", await _make_handler(skills.book_appointment))
-    llm.register_function("capture_lead", await _make_handler(skills.capture_lead))
-    llm.register_function("take_message", await _make_handler(skills.take_message))
-    llm.register_function("escalate", await _make_handler(skills.escalate))
-
-    async def _handle_get_day_of_week(params):
-        result = skills.get_day_of_week(**params.arguments)
+    # The tools and the code that runs them are the text channel's own
+    # (agent.py), so chat and voice can't drift apart. They had: voice kept
+    # its own copy of the schemas, and its escalate declared only "reason",
+    # so a phoned-in escalation arrived with no name or number to call back.
+    async def _run_tool(params):
+        result = _execute_tool(db, tenant.id, conversation.id, params.function_name, dict(params.arguments))
         await params.result_callback(result)
 
-    async def _handle_get_current_date(params):
-        result = skills.get_current_date()
-        await params.result_callback(result)
-
-    llm.register_function("get_day_of_week", _handle_get_day_of_week)
-    llm.register_function("get_current_date", _handle_get_current_date)
+    for tool in AGENT_TOOLS:
+        llm.register_function(tool["function"]["name"], _run_tool)
 
     tools = ToolsSchema(standard_tools=[
         FunctionSchema(
-            name="book_appointment", description="Book an appointment for the caller.",
-            properties={
-                "datetime_str": {"type": "string", "description": "ISO format, e.g. 2026-07-30T14:00:00"},
-                "name": {"type": "string"}, "phone": {"type": "string"},
-            },
-            required=["datetime_str", "name"],
-        ),
-        FunctionSchema(
-            name="capture_lead", description="Log a caller's interest when they're not ready to book yet.",
-            properties={"name": {"type": "string"}, "phone": {"type": "string"}, "intent": {"type": "string"}},
-            required=["name", "intent"],
-        ),
-        FunctionSchema(
-            name="take_message", description="Log a message for the business to follow up on.",
-            properties={"name": {"type": "string"}, "phone": {"type": "string"}, "message": {"type": "string"}},
-            required=["name", "message"],
-        ),
-        FunctionSchema(
-            name="escalate", description="Flag this conversation for a human — pricing, medical/sensitive topics, or anything you should not answer.",
-            properties={"reason": {"type": "string"}},
-            required=["reason"],
-        ),
-        FunctionSchema(
-            name="get_day_of_week", description="Get the exact day of the week for a given date. ALWAYS use this instead of calculating the day of week yourself.",
-            properties={"date_str": {"type": "string", "description": "Date in YYYY-MM-DD format"}},
-            required=["date_str"],
-        ),
-        FunctionSchema(
-            name="get_current_date", description="Get today's actual current date and day of week. ALWAYS use this first if the caller references 'today', 'tomorrow', 'this Friday', or any relative date — never assume or guess today's date yourself.",
-            properties={},
-            required=[],
-        ),
+            name=tool["function"]["name"],
+            description=tool["function"]["description"],
+            properties=tool["function"]["parameters"].get("properties", {}),
+            required=tool["function"]["parameters"].get("required", []),
+        )
+        for tool in AGENT_TOOLS
     ])
     system_prompt = f"""You are the AI receptionist for {tenant.name}, a {tenant.vertical or "general"} business, speaking on a live phone call.
 
