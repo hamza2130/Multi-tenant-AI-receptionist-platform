@@ -1,50 +1,78 @@
 """
 voice_server.py
 
-The real-time voice pipeline: a caller (real phone OR the Admin
-Console's Test Sandbox, via browser) connects, and Pipecat runs
-VAD -> STT -> LLM (with tools) -> TTS in real time, streamed over a
-WebSocket (Twilio Media Streams).
+The real-time voice pipeline: a caller connects, and Pipecat runs
+VAD -> STT -> LLM (with tools) -> TTS in real time.
 
-Tenant resolution — two paths:
-  - Real phone calls: resolved from the dialed number ("To" field).
-  - Test Sandbox (browser) calls: resolved from an explicit tenant_id
-    custom parameter, sent by the console for the logged-in owner's
-    own business — this does NOT affect real phone call resolution,
-    which is untouched and works exactly as before.
+Three ways in, one shared pipeline (run_receptionist):
+  - Real phone calls: Twilio Media Streams over a WebSocket (/voice then
+    /ws), resolved from the dialed number ("To" field).
+  - Embedded widget calls: also via Twilio (browser -> TwiML App -> /voice),
+    resolved from the tenant's API key.
+  - Test Sandbox calls: peer-to-peer WebRTC straight from the Admin Console
+    (/webrtc/offer), resolved from the logged-in owner's session. No Twilio
+    account, phone number, or ngrok needed — this is the free way to test
+    the whole voice pipeline.
 
-Day 10 (Ops): every call is logged — transcript, recording, and an
-AI-generated summary — via call_logging.py.
+Day 10 (Ops): every call is logged — transcript, recording (Twilio calls
+only), and an AI-generated summary — via call_logging.py.
 
 Run with:
     uvicorn voice_server:app --reload --port 8001
 """
 
 import json
-from fastapi import FastAPI, WebSocket, Request, Response
+from fastapi import FastAPI, WebSocket, Request, Response, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config import settings
 from database import SessionLocal
-from models import Tenant, Conversation, Channel, Config, Document
+from models import Tenant, Conversation, Channel, Config, Document, KnowledgeSource
+import auth
 import skills
 from call_logging import start_call_recording, save_transcript, close_conversation
 from agent import _format_settings
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask, PipelineParams
+from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequest, SmallWebRTCRequestHandler
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
 app = FastAPI(title="AI Receptionist Platform — Voice")
+
+# The Admin Console (port 3000) calls /webrtc/offer straight from the
+# browser. Who may start a call is decided by the owner's session token,
+# not by the request's origin — same reasoning as main.py.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Tracks every live Test Sandbox peer connection until it closes. No ICE
+# servers: host candidates are enough when the console and this server
+# run on the same machine or LAN. Testing against a remote server would
+# need STUN/TURN servers passed in here.
+webrtc_handler = SmallWebRTCRequestHandler()
 
 
 def _get_tenant_by_phone(db: Session, phone_number: str) -> Tenant | None:
@@ -52,101 +80,37 @@ def _get_tenant_by_phone(db: Session, phone_number: str) -> Tenant | None:
     return db.query(Tenant).filter(Tenant.phone_number == phone_number).first()
 
 
-@app.post("/voice")
-async def voice_webhook(request: Request):
+def _knowledge_context(db: Session, tenant_id: str) -> str:
     """
-    Twilio calls this the moment a call connects — either a real
-    phone call (dialed number present) or a Test Sandbox browser call
-    (an explicit tenant_id custom parameter present instead).
+    The tenant's knowledge base as one block of text, in reading order:
+    oldest source first, and each source's chunks in their original
+    sequence. Ordering by chunk_index alone would interleave sources
+    (every source's first chunk, then every source's second chunk...).
     """
-    form = await request.form()
-    dialed_number = form.get("To", "")
-    tenant_id_param = form.get("tenant_id", "")  # present only for Test Sandbox calls
-    tenant_api_key_param = form.get("tenant_api_key", "")  # present only for widget calls
-
-    ws_url = f"{settings.PUBLIC_BASE_URL.replace('https://', 'wss://').replace('http://', 'ws://')}/ws"
-
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{ws_url}">
-      <Parameter name="dialed_number" value="{dialed_number}" />
-      <Parameter name="tenant_id" value="{tenant_id_param}" />
-      <Parameter name="tenant_api_key" value="{tenant_api_key_param}" />
-    </Stream>
-  </Connect>
-</Response>"""
-    return Response(content=twiml, media_type="text/xml")
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    # Twilio's Media Stream protocol sends "connected" then "start"
-    # as the first two JSON messages before any audio.
-    start_data = websocket.iter_text()
-    await start_data.__anext__()  # "connected" event, not needed
-    call_data = json.loads(await start_data.__anext__())  # "start" event
-
-    stream_sid = call_data["start"]["streamSid"]
-    call_sid = call_data["start"]["callSid"]
-    custom_params = call_data["start"]["customParameters"]
-    dialed_number = custom_params.get("dialed_number", "")
-    tenant_id_param = custom_params.get("tenant_id", "")
-    tenant_api_key_param = custom_params.get("tenant_api_key", "")
-
-    db = SessionLocal()
-
-    if tenant_id_param:
-        # Test Sandbox (browser) call — resolve by the exact tenant_id
-        # sent from the console, scoped to whichever business owner
-        # is actually logged in.
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id_param).first()
-    elif tenant_api_key_param:
-        # Embedded widget (browser) call — resolve by the tenant's API
-        # key, the same identifier the widget already uses for chat.
-        tenant = db.query(Tenant).filter(Tenant.api_key == tenant_api_key_param).first()
-    else:
-        # Real phone call — resolve by the dialed number, unchanged
-        # from how this has always worked.
-        tenant = _get_tenant_by_phone(db, dialed_number)
-
-    print(f"[DEBUG] tenant_id_param={tenant_id_param!r} tenant_api_key_param={tenant_api_key_param!r} dialed_number={dialed_number!r} resolved_tenant={tenant}")
-
-    if not tenant:
-        await websocket.close()
-        db.close()
-        return
-
-    # Day 10 (Ops): log this call as a Conversation, and start a
-    # Twilio recording via the REST API (separate from the Media
-    # Stream used for the live audio pipeline). Recording failure is
-    # non-fatal — it should never block the call itself.
-    conversation = Conversation(tenant_id=tenant.id, channel=Channel.voice)
-    db.add(conversation)
-    db.commit()
-    db.refresh(conversation)
-    recording_sid = start_call_recording(call_sid)
-
-    serializer = TwilioFrameSerializer(
-        stream_sid=stream_sid,
-        call_sid=call_sid,
-        account_sid=settings.TWILIO_ACCOUNT_SID,
-        auth_token=settings.TWILIO_AUTH_TOKEN,
+    documents = (
+        db.query(Document)
+        .join(KnowledgeSource, Document.source_id == KnowledgeSource.id)
+        .filter(Document.tenant_id == tenant_id)
+        .order_by(KnowledgeSource.created_at, KnowledgeSource.id, Document.chunk_index)
+        .all()
     )
+    knowledge_context = "\n\n".join(d.chunk_text for d in documents)[:4000]
+    return knowledge_context or "(No knowledge base content added yet.)"
 
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(),
-            serializer=serializer,
-        ),
-    )
 
+async def run_receptionist(
+    transport: BaseTransport,
+    db: Session,
+    tenant: Tenant,
+    conversation: Conversation,
+    recording_sid: str | None = None,
+):
+    """
+    Runs one call from greeting to hang-up, on any transport. Phone,
+    widget, and Test Sandbox calls all go through here, so a prompt rule,
+    skill, or tool schema can't drift between them. Owns `db` for the
+    call's lifetime and closes it when the call ends.
+    """
     stt = DeepgramSTTService(
         api_key=settings.DEEPGRAM_API_KEY,
         settings=DeepgramSTTService.Settings(
@@ -169,16 +133,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # good enough to ground the whole call, and far better than none.
     config = db.query(Config).filter(Config.tenant_id == tenant.id).first()
     settings_section = _format_settings(config)
-
-    knowledge_docs = (
-        db.query(Document)
-        .filter(Document.tenant_id == tenant.id)
-        .order_by(Document.chunk_index)
-        .all()
-    )
-    knowledge_context = "\n\n".join(d.chunk_text for d in knowledge_docs)[:4000]
-    if not knowledge_context:
-        knowledge_context = "(No knowledge base content added yet.)"
+    knowledge_context = _knowledge_context(db, tenant.id)
 
     # Register the same four skills as the text channel (agent.py),
     # so booking/leads/messages/escalation behave identically on
@@ -298,7 +253,14 @@ CONTEXT:
 """
 
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}], tools=tools)
-    context_aggregator = LLMContextAggregatorPair(context)
+    # Voice activity detection belongs on the user aggregator in Pipecat
+    # 1.x. It used to be passed in the transport params, which silently
+    # ignore unknown fields — so calls ran with no VAD, which both turn
+    # detection and barge-in (interrupting the bot) rely on.
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
 
     pipeline = Pipeline([
         transport.input(),
@@ -310,26 +272,42 @@ CONTEXT:
         context_aggregator.assistant(),
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-    runner = PipelineRunner()
+    # RTVI is the message protocol of Pipecat's own client SDKs, which no
+    # caller here uses (the console speaks plain WebRTC, phones speak Twilio).
+    # Left on, it logs a warning for every console message, like "hangup".
+    task = PipelineTask(pipeline, enable_rtvi=False)
 
     # Deterministic greeting — templated from the tenant's own data,
     # never LLM-generated, so it's instant (no generation latency),
     # costs nothing per call, and is always consistent and on-brand.
+    # Queued once the caller is actually connected, so a WebRTC caller
+    # whose audio isn't flowing yet doesn't miss the start of it.
     #
-    # Consent notice: every call is recorded (start_call_recording
-    # above), so callers must be told this before anything else
-    # happens — required in many jurisdictions, and standard practice
-    # regardless. Kept as a separate, fixed sentence before the
-    # greeting, not merged into it, so it reads as a clear, standard
-    # disclosure rather than part of the friendly welcome message.
-    from pipecat.frames.frames import TTSSpeakFrame
+    # Consent notice: Twilio calls are recorded (start_call_recording),
+    # so callers must be told this before anything else happens —
+    # required in many jurisdictions, and standard practice regardless.
+    # Kept as a separate, fixed sentence before the greeting, not merged
+    # into it, so it reads as a clear, standard disclosure rather than
+    # part of the friendly welcome message.
     consent_notice = "This call may be recorded for quality and training purposes."
     greeting = f"Thanks for calling {tenant.name}. How can I help you today?"
-    await task.queue_frames([
-        TTSSpeakFrame(consent_notice),
-        TTSSpeakFrame(greeting),
-    ])
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await task.queue_frames([
+            TTSSpeakFrame(consent_notice),
+            TTSSpeakFrame(greeting),
+        ])
+
+    # Without this the pipeline outlives the caller until Pipecat's idle
+    # timeout (5 minutes), and the transcript and summary wait with it.
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await task.cancel()
+
+    # Many calls share this one uvicorn process, so no call should take
+    # over Ctrl+C — that's the server's to handle.
+    runner = PipelineRunner(handle_sigint=False)
     try:
         await runner.run(task)
     finally:
@@ -338,3 +316,166 @@ CONTEXT:
         save_transcript(db, conversation.id, context.messages)
         close_conversation(db, conversation.id, recording_sid)
         db.close()
+
+
+# ==================== Twilio: phone and widget calls ====================
+
+@app.post("/voice")
+async def voice_webhook(request: Request):
+    """
+    Twilio calls this the moment a call connects — either a real
+    phone call (dialed number present) or an embedded widget browser
+    call (the tenant's API key as a custom parameter instead).
+    """
+    form = await request.form()
+    dialed_number = form.get("To", "")
+    tenant_id_param = form.get("tenant_id", "")  # legacy Test Sandbox calls only — see websocket_endpoint
+    tenant_api_key_param = form.get("tenant_api_key", "")  # present only for widget calls
+
+    ws_url = f"{settings.PUBLIC_BASE_URL.replace('https://', 'wss://').replace('http://', 'ws://')}/ws"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{ws_url}">
+      <Parameter name="dialed_number" value="{dialed_number}" />
+      <Parameter name="tenant_id" value="{tenant_id_param}" />
+      <Parameter name="tenant_api_key" value="{tenant_api_key_param}" />
+    </Stream>
+  </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    # Twilio's Media Stream protocol sends "connected" then "start"
+    # as the first two JSON messages before any audio.
+    start_data = websocket.iter_text()
+    await start_data.__anext__()  # "connected" event, not needed
+    call_data = json.loads(await start_data.__anext__())  # "start" event
+
+    stream_sid = call_data["start"]["streamSid"]
+    call_sid = call_data["start"]["callSid"]
+    custom_params = call_data["start"]["customParameters"]
+    dialed_number = custom_params.get("dialed_number", "")
+    tenant_id_param = custom_params.get("tenant_id", "")
+    tenant_api_key_param = custom_params.get("tenant_api_key", "")
+
+    db = SessionLocal()
+
+    if tenant_id_param:
+        # Legacy Twilio-based Test Sandbox call. The console now tests
+        # over WebRTC (/webrtc/offer) instead, so nothing sends this
+        # parameter anymore — and it isn't authenticated.
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id_param).first()
+    elif tenant_api_key_param:
+        # Embedded widget (browser) call — resolve by the tenant's API
+        # key, the same identifier the widget already uses for chat.
+        tenant = db.query(Tenant).filter(Tenant.api_key == tenant_api_key_param).first()
+    else:
+        # Real phone call — resolve by the dialed number, unchanged
+        # from how this has always worked.
+        tenant = _get_tenant_by_phone(db, dialed_number)
+
+    print(f"[DEBUG] tenant_id_param={tenant_id_param!r} tenant_api_key_param={tenant_api_key_param!r} dialed_number={dialed_number!r} resolved_tenant={tenant}")
+
+    if not tenant:
+        await websocket.close()
+        db.close()
+        return
+
+    # Day 10 (Ops): log this call as a Conversation, and start a
+    # Twilio recording via the REST API (separate from the Media
+    # Stream used for the live audio pipeline). Recording failure is
+    # non-fatal — it should never block the call itself.
+    conversation = Conversation(tenant_id=tenant.id, channel=Channel.voice)
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    recording_sid = start_call_recording(call_sid)
+
+    serializer = TwilioFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        account_sid=settings.TWILIO_ACCOUNT_SID,
+        auth_token=settings.TWILIO_AUTH_TOKEN,
+    )
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            serializer=serializer,
+        ),
+    )
+
+    await run_receptionist(transport, db, tenant, conversation, recording_sid)
+
+
+# ==================== WebRTC: Test Sandbox calls ====================
+
+class WebRTCOffer(BaseModel):
+    sdp: str
+    type: str
+
+
+@app.post("/webrtc/offer")
+async def webrtc_offer(
+    offer: WebRTCOffer,
+    background_tasks: BackgroundTasks,
+    user=Depends(auth.get_current_user),
+):
+    """
+    Starts a Test Sandbox call. The console sends its WebRTC offer with
+    the owner's session token and gets an answer back; audio then flows
+    browser-to-server directly. The call always reaches the logged-in
+    owner's own receptionist — the tenant comes from the token, never
+    from the request body.
+    """
+    tenant_id = user.tenant_id
+
+    async def start_call(connection: SmallWebRTCConnection):
+        # The handler awaits this before returning the answer, so the
+        # call itself has to run after the response, not inline.
+        background_tasks.add_task(_run_webrtc_call, connection, tenant_id)
+
+    return await webrtc_handler.handle_web_request(
+        SmallWebRTCRequest(sdp=offer.sdp, type=offer.type),
+        start_call,
+    )
+
+
+async def _run_webrtc_call(connection: SmallWebRTCConnection, tenant_id: str):
+    db = SessionLocal()
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        await connection.disconnect()
+        db.close()
+        return
+
+    conversation = Conversation(tenant_id=tenant.id, channel=Channel.voice)
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+
+    transport = SmallWebRTCTransport(
+        webrtc_connection=connection,
+        params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+    )
+
+    # The console sends {"type": "hangup"} over the data channel when the
+    # owner hangs up, so the call ends on an explicit signal. A browser that
+    # closes its connection cleanly (tab closed) is noticed within a second
+    # anyway; this matters most when that close never arrives. Closing our
+    # side fires on_client_disconnected, which ends the call.
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        if isinstance(message, dict) and message.get("type") == "hangup":
+            await connection.disconnect()
+
+    await run_receptionist(transport, db, tenant, conversation)

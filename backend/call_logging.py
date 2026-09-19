@@ -21,8 +21,6 @@ from config import settings
 from models import Conversation, Message, MessageRole
 from llm_client import generate
 
-_twilio_client = TwilioClient(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-
 
 def start_call_recording(call_sid: str) -> str | None:
     """
@@ -30,9 +28,15 @@ def start_call_recording(call_sid: str) -> str | None:
     (separate from the Media Stream used for the live audio pipeline).
     Returns the recording SID, or None if it fails — recording failure
     should never break the call itself, so this is caught, not raised.
+
+    The Twilio client is created here, per call, rather than at import:
+    Twilio's SDK refuses empty credentials, and building it at import
+    stopped the whole voice server from starting without a Twilio
+    account — including for WebRTC test calls, which never touch Twilio.
     """
     try:
-        recording = _twilio_client.calls(call_sid).recordings.create()
+        twilio_client = TwilioClient(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+        recording = twilio_client.calls(call_sid).recordings.create()
         return recording.sid
     except Exception as e:
         print(f"[call_logging] Failed to start recording: {e}")

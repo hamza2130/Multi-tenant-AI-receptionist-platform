@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import Script from "next/script";
 
 type TenantInfo = {
   tenant_id: string;
@@ -10,11 +9,8 @@ type TenantInfo = {
   api_key: string;
 };
 
-declare global {
-  interface Window {
-    Twilio: any;
-  }
-}
+// voice_server.py — test calls go straight to it over WebRTC.
+const VOICE_API = "http://localhost:8001";
 
 export default function TestSandboxPage() {
   const [tab, setTab] = useState<"chat" | "call">("chat");
@@ -85,7 +81,7 @@ export default function TestSandboxPage() {
               <TabButton label="💬 Chat" active={tab === "chat"} onClick={() => setTab("chat")} />
               <TabButton label="📞 Call" active={tab === "call"} onClick={() => setTab("call")} />
             </div>
-            {tab === "chat" ? <ChatPanel apiKey={info.api_key} /> : <CallPanel tenantId={info.tenant_id} />}
+            {tab === "chat" ? <ChatPanel apiKey={info.api_key} /> : <CallPanel token={token ?? ""} />}
           </div>
         )}
       </main>
@@ -155,74 +151,205 @@ function ChatPanel({ apiKey }: { apiKey: string }) {
   );
 }
 
-function CallPanel({ tenantId }: { tenantId: string }) {
-  const [status, setStatus] = useState("Loading…");
-  const [connected, setConnected] = useState(false);
-  const deviceRef = useRef<any>(null);
-  const callRef = useRef<any>(null);
-  const [sdkReady, setSdkReady] = useState(false);
+type CallState = "idle" | "connecting" | "live" | "ended" | "error";
 
-  useEffect(() => {
-    if (!sdkReady) return;
-    (async () => {
-      try {
-        const res = await fetch("http://localhost:8000/token");
-        const data = await res.json();
-        const device = new window.Twilio.Device(data.token, { logLevel: 1 });
-        device.on("registered", () => setStatus("Ready to call."));
-        device.on("error", (err: any) => setStatus("Error: " + err.message));
-        await device.register();
-        deviceRef.current = device;
-      } catch (err) {
-        setStatus("Setup failed: " + (err instanceof Error ? err.message : "unknown error"));
-      }
-    })();
-  }, [sdkReady]);
+const CALL_STATUS: Record<Exclude<CallState, "error">, string> = {
+  idle: "Uses your browser's microphone — no phone number or Twilio account needed.",
+  connecting: "Connecting to your receptionist…",
+  live: "Connected — say something!",
+  ended: "Call ended. Anything it booked or noted is in Bookings and Leads & Messages.",
+};
+
+// A test call over WebRTC, straight to voice_server.py — the same pipeline
+// a real phone caller reaches, minus the phone network.
+function CallPanel({ token }: { token: string }) {
+  const [state, setState] = useState<CallState>("idle");
+  const [error, setError] = useState("");
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const micRef = useRef<MediaStream | null>(null);
+  const channelRef = useRef<RTCDataChannel | null>(null);
+  const pingRef = useRef<number | null>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  // Safe to call more than once — hanging up, a dropped connection, and
+  // leaving the page can all land here.
+  const teardown = useCallback(() => {
+    if (pingRef.current !== null) {
+      window.clearInterval(pingRef.current);
+      pingRef.current = null;
+    }
+    channelRef.current?.close();
+    channelRef.current = null;
+    pcRef.current?.close();
+    pcRef.current = null;
+    micRef.current?.getTracks().forEach((track) => track.stop());
+    micRef.current = null;
+    if (audioRef.current) audioRef.current.srcObject = null;
+  }, []);
+
+  const sendHangup = useCallback(() => {
+    if (channelRef.current?.readyState === "open") {
+      channelRef.current.send(JSON.stringify({ type: "hangup" }));
+    }
+  }, []);
+
+  // Leaving the page mid-call hangs up rather than leaving the mic open.
+  useEffect(
+    () => () => {
+      sendHangup();
+      teardown();
+    },
+    [sendHangup, teardown],
+  );
+
+  function fail(message: string) {
+    teardown();
+    setError(message);
+    setState("error");
+  }
+
+  function endCall() {
+    teardown();
+    setState("ended");
+  }
 
   async function call() {
-    setStatus("Calling…");
-    // Passing tenant_id as a custom param — this is what lets the sandbox
-    // test THIS specific business, instead of always connecting to
-    // whichever tenant happens to have a phone number configured.
-    const activeCall = await deviceRef.current.connect({ params: { tenant_id: tenantId } });
-    callRef.current = activeCall;
-    activeCall.on("accept", () => {
-      setStatus("Connected — say something!");
-      setConnected(true);
-    });
-    activeCall.on("disconnect", () => {
-      setStatus("Call ended.");
-      setConnected(false);
-    });
+    setError("");
+    setState("connecting");
+    try {
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micRef.current = mic;
+
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+
+      // The voice server reads tracks by position — audio, then video, then
+      // screen — so the audio transceiver has to be the first one created.
+      pc.addTransceiver(mic.getAudioTracks()[0], { direction: "sendrecv" });
+
+      // The server only sends audio while pings keep arriving (one a second);
+      // the same channel carries our "hangup" and its "peerLeft".
+      const channel = pc.createDataChannel("chat");
+      channelRef.current = channel;
+      channel.onopen = () => {
+        pingRef.current = window.setInterval(() => {
+          if (channel.readyState === "open") channel.send("ping");
+        }, 1000);
+      };
+      channel.onmessage = (event) => {
+        if (isPeerLeft(event.data)) endCall();
+      };
+
+      pc.ontrack = (event) => {
+        if (audioRef.current) {
+          audioRef.current.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "connected") setState("live");
+        if (pc.connectionState === "failed") {
+          fail("The audio connection dropped. Check the voice server is still running, then call again.");
+        }
+      };
+
+      await pc.setLocalDescription(await pc.createOffer());
+      await iceGatheringComplete(pc);
+      const offer = pc.localDescription;
+      if (!offer) throw new Error("Your browser couldn't prepare the call. Try again.");
+
+      let res: Response;
+      try {
+        res = await fetch(`${VOICE_API}/webrtc/offer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+        });
+      } catch {
+        throw new Error("Can't reach the voice server. Start it with: uvicorn voice_server:app --port 8001");
+      }
+      if (res.status === 401) throw new Error("Your session has expired. Sign in again to test calls.");
+      if (!res.ok) throw new Error(`The voice server couldn't start the call (error ${res.status}).`);
+
+      const answer = await res.json();
+      await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+    } catch (err) {
+      fail(describeCallError(err));
+    }
   }
 
   function hangup() {
-    callRef.current?.disconnect();
+    sendHangup();
+    // Give the hangup message a moment to leave before closing the connection.
+    // The Hang Up button stays up until then, so a quick re-dial can't be
+    // torn down by this timer.
+    window.setTimeout(endCall, 250);
   }
 
   return (
     <div className="p-8 text-center">
-      <Script src="https://cdn.jsdelivr.net/npm/@twilio/voice-sdk@2.18.3/dist/twilio.min.js" onLoad={() => setSdkReady(true)} />
       <p className="text-sm text-ink-soft mb-6">Talk to it directly through your microphone.</p>
-      {!connected ? (
-        <button
-          onClick={call}
-          disabled={status !== "Ready to call."}
-          className="bg-teal-deep disabled:opacity-50 hover:bg-teal-mid text-paper font-semibold text-sm px-6 py-3 rounded-full transition-colors"
-        >
-          📞 Call Receptionist
-        </button>
-      ) : (
+      {state === "live" ? (
         <button
           onClick={hangup}
           className="bg-danger hover:bg-danger/90 text-paper font-semibold text-sm px-6 py-3 rounded-full transition-colors"
         >
           Hang Up
         </button>
+      ) : (
+        <button
+          onClick={call}
+          disabled={state === "connecting"}
+          className="bg-teal-deep disabled:opacity-50 hover:bg-teal-mid text-paper font-semibold text-sm px-6 py-3 rounded-full transition-colors"
+        >
+          {state === "connecting" ? "Connecting…" : "📞 Call Receptionist"}
+        </button>
       )}
-      <p className="text-xs text-ink-soft mt-4">{status}</p>
+      <p className={`text-xs mt-4 ${state === "error" ? "text-danger" : "text-ink-soft"}`}>
+        {state === "error" ? error : CALL_STATUS[state]}
+      </p>
+      <audio ref={audioRef} autoPlay />
     </div>
   );
+}
+
+// The voice server doesn't take trickled candidates, so the offer has to
+// carry all of them. Local candidates arrive almost at once; the timeout
+// only stops a slow network adapter from stalling the call.
+function iceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 2000): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      pc.removeEventListener("icegatheringstatechange", check);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const check = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+// The server sends this when it ends the call itself (e.g. after 5 idle minutes).
+function isPeerLeft(data: unknown): boolean {
+  if (typeof data !== "string") return false;
+  try {
+    const message = JSON.parse(data);
+    return message?.type === "signalling" && message?.message?.type === "peerLeft";
+  } catch {
+    return false;
+  }
+}
+
+function describeCallError(err: unknown): string {
+  if (err instanceof DOMException && err.name === "NotAllowedError") {
+    return "Microphone access is blocked. Allow it for this site in your browser, then call again.";
+  }
+  if (err instanceof DOMException && err.name === "NotFoundError") {
+    return "No microphone found. Connect one, then call again.";
+  }
+  return err instanceof Error ? err.message : "The call couldn't start. Try again.";
 }
 
 function TabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {

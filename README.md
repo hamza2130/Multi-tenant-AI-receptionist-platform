@@ -16,7 +16,7 @@ One shared codebase serves every business. Each tenant's data (knowledge base, s
 - [Running the Project](#running-the-project)
 - [Docker (Postgres & Qdrant)](#docker-postgres--qdrant)
 - [Feature Overview](#feature-overview)
-- [Browser Calling — What It Is, and How to Remove It](#browser-calling--what-it-is-and-how-to-remove-it)
+- [Test Calls and Browser Calling](#test-calls-and-browser-calling)
 - [Known Limitations & Next Steps](#known-limitations--next-steps)
 
 ---
@@ -44,9 +44,12 @@ One shared codebase serves every business. Each tenant's data (knowledge base, s
 
 ┌──────────────┐          ┌─────────────────────┐
 │  Phone call / │  Twilio  │   voice_server.py    │
-│  Browser call │─────────▶│   Pipecat voice       │──▶ Deepgram (STT)
+│  Widget call  │─────────▶│   Pipecat voice       │──▶ Deepgram (STT)
 └──────────────┘          │   pipeline, port 8001 │──▶ Groq (LLM)
-                          └────────────────────────┘──▶ ElevenLabs (TTS)
+┌──────────────┐  WebRTC  │                       │──▶ ElevenLabs (TTS)
+│ Test Sandbox  │─────────▶│                       │
+│ call (free)   │          └───────────────────────┘
+└──────────────┘
 ```
 
 **Multi-tenancy rule:** every request resolves a `tenant_id` (via API key, JWT session, or dialed phone number). All retrieval, config, and tool calls are scoped to that tenant. There are no shared Qdrant collections — this is a hard security boundary, not a convention.
@@ -60,6 +63,7 @@ One shared codebase serves every business. Each tenant's data (knowledge base, s
 | Backend API | FastAPI (Python) |
 | Voice pipeline | Pipecat 1.6.0 |
 | Telephony | Twilio (SIP/Voice + WhatsApp) |
+| Test calls | WebRTC via Pipecat's SmallWebRTC (peer-to-peer, free) |
 | STT | Deepgram (Nova-2) |
 | LLM | Groq |
 | TTS | ElevenLabs |
@@ -140,9 +144,9 @@ ELEVENLABS_VOICE_ID=<voice-id>
 
 TWILIO_ACCOUNT_SID=<your-sid>
 TWILIO_AUTH_TOKEN=<your-token>
-TWILIO_API_KEY_SID=<your-key-sid>       # used for browser calling only — see note below
-TWILIO_API_KEY_SECRET=<your-key-secret> # used for browser calling only
-TWILIO_TWIML_APP_SID=<your-app-sid>     # used for browser calling only
+TWILIO_API_KEY_SID=<your-key-sid>       # used for widget browser calling only — see note below
+TWILIO_API_KEY_SECRET=<your-key-secret> # used for widget browser calling only
+TWILIO_TWIML_APP_SID=<your-app-sid>     # used for widget browser calling only
 TWILIO_WHATSAPP_FROM=+14155238886       # Twilio's shared Sandbox number by default
 
 PUBLIC_BASE_URL=https://your-ngrok-url.ngrok-free.dev  # updates every time ngrok restarts on a free plan
@@ -233,6 +237,8 @@ venv\Scripts\activate   # or source venv/bin/activate
 uvicorn voice_server:app --reload --port 8001
 ```
 
+This is all the Test Sandbox's **Call** tab needs. It connects straight to this server over WebRTC, so test calls need no Twilio account, phone number or ngrok. You still need the Deepgram, Groq and ElevenLabs keys, since those do the listening, thinking and speaking. If you installed the backend before WebRTC support was added, re-run `pip install -r requirements.txt` to get it.
+
 ### 4. Start the Admin Console
 
 In a separate terminal:
@@ -254,15 +260,15 @@ cd widget
 python -m http.server 5500
 ```
 
-### 6. (Optional) ngrok — required only for real/browser phone calls
+### 6. (Optional) ngrok — required only for real phone calls and widget calls
 
-Twilio needs a public URL to reach your local `/voice` webhook:
+Twilio needs a public URL to reach your local `/voice` webhook. Test Sandbox calls don't go through Twilio, so they don't need this.
 
 ```bash
 ngrok http 8001
 ```
 
-Copy the forwarding URL into `PUBLIC_BASE_URL` in `.env`, and set it as the Voice webhook on your Twilio phone number (and/or TwiML App, if using browser calling — see below).
+Copy the forwarding URL into `PUBLIC_BASE_URL` in `.env`, and set it as the Voice webhook on your Twilio phone number (and/or TwiML App, if using widget browser calling — see below).
 
 **Note:** ngrok's URL changes every time you restart it on the free plan. You'll need to update `PUBLIC_BASE_URL` and your Twilio number's webhook each time, unless you have a paid ngrok plan with a reserved domain.
 
@@ -314,34 +320,40 @@ docker exec receptionist_postgres psql -U receptionist -d receptionist_platform 
 - **WhatsApp escalation alerts** — business owners get an instant WhatsApp message when something is escalated (requires completing Twilio's WhatsApp Sandbox setup — see `backend/whatsapp.py`)
 - **Embeddable widget** — a small floating chat bubble any business can paste onto their own website (`Publish` page in the Admin Console generates the exact snippet)
 - **Phone calls** — real inbound calls via Twilio, resolved to the correct tenant by dialed number
-- **Browser calling** — an additional way to test the voice pipeline without a phone (see next section)
+- **Free test calls** — talk to your receptionist from the Test Sandbox over WebRTC, through the same pipeline a phone caller reaches (see next section)
+- **Widget calling** — website visitors can call from the embedded widget, via Twilio browser calling
 
 ---
 
-## Browser Calling — What It Is, and How to Remove It
+## Test Calls and Browser Calling
 
-**Real phone calls (the actual product requirement) work independently of everything below** — `voice_server.py` resolves a real inbound call by the dialed phone number (`Tenant.phone_number`), completely separate from browser calling.
+**Real phone calls (the actual product requirement) work independently of everything below.** `voice_server.py` routes a real inbound call by the dialed phone number (`Tenant.phone_number`), separately from both kinds of browser call.
 
-**Browser calling** is an additional entry point into the *same* voice pipeline, using WebRTC from a browser microphone instead of a real phone. It exists in the Admin Console's Test Sandbox and the embeddable widget, and was primarily used during development to test and debug the voice pipeline (STT, LLM tool-calling, booking, escalation) without depending on a live phone number.
+There are two ways to call the receptionist from a browser. Both reach the *same* voice pipeline a phone caller reaches (`run_receptionist()` in `voice_server.py`), so what you hear is what callers get.
 
-**If you want to remove it**, here is exactly what to delete or revert, file by file:
+### Test Sandbox calls (free, WebRTC)
+
+The Admin Console's Test Sandbox **Call** tab connects your microphone straight to `voice_server.py` over peer-to-peer WebRTC (`POST /webrtc/offer`). There's no Twilio in the path, so it costs nothing beyond your Deepgram, Groq and ElevenLabs usage, and it needs no phone number, Twilio account or ngrok. The call is tied to your login, so it always reaches your own business's receptionist.
+
+What it doesn't test: phone-network audio (8kHz, compressed) and carrier latency. Before going live, still place one real phone call. It also assumes the console and the voice server share a machine or local network, because no STUN/TURN servers are configured.
+
+### Widget calls (Twilio browser calling)
+
+The embeddable widget's **Call** tab uses Twilio's Voice SDK. It gets a token from `GET /token` on `main.py`, and Twilio then connects the call to `voice_server.py` through a TwiML App. This needs the Twilio browser-calling keys, and ngrok when running locally.
+
+**If you want to remove widget calling**, here is exactly what to delete or revert, file by file:
 
 ### Backend
 
 **`backend/main.py`**
-- Remove the `GET /token` route entirely (issues Twilio Access Tokens — used only by browser calling)
+- Remove the `GET /token` route entirely (issues Twilio Access Tokens — used only by widget calling)
 
 **`backend/voice_server.py`**
 - In `voice_webhook()`: remove the `tenant_id_param` and `tenant_api_key_param` handling — real calls only ever use `dialed_number`
-- In `websocket_endpoint()`: remove the `if tenant_id_param:` and `elif tenant_api_key_param:` branches — keep only the `else: tenant = _get_tenant_by_phone(...)` path
+- In `websocket_endpoint()`: remove the `if tenant_id_param:` and `elif tenant_api_key_param:` branches — keep only the `else: tenant = _get_tenant_by_phone(...)` path. (Nothing sends `tenant_id` anymore; the Test Sandbox used to, before it moved to WebRTC.)
 - These two params can also be removed from the `<Parameter>` tags in the TwiML response
 
 ### Frontend
-
-**`admin-console/app/dashboard/test-sandbox/page.tsx`**
-- Remove the entire `CallPanel` component
-- Remove the "Call" tab button and its related state (`tab`, `TabButton` for "Call")
-- Keep the `ChatPanel` and everything related to chat
 
 **`widget/widget_combined.html`**
 - Remove the Twilio Voice SDK `<script>` tag
@@ -360,7 +372,7 @@ docker exec receptionist_postgres psql -U receptionist -d receptionist_platform 
 This section is intentionally honest about what's not finished, so anyone picking this up knows exactly where things stand.
 
 - **Real inbound phone-call testing is not yet fully verified**, and **WhatsApp escalation alerts have not been live-tested**, because both require a working Twilio account with a purchased phone number (for calls) and a completed WhatsApp Sandbox/Business setup (for alerts) — this has been blocked by external Twilio account access issues during development (trial verification restrictions, and a suspected carrier-level call-blocking issue). The backend logic for both is complete and correct; what remains is Twilio account setup, not code.
-- **Some tenants' Knowledge Base content needs re-ingesting.** A chunking bug was found and fixed (paragraph boundaries were being silently destroyed before chunking ran), but the fix only applies to newly-ingested content. Any tenant's Knowledge Base ingested before the fix should be deleted and re-added to benefit from it.
+- **Some tenants' Knowledge Base content needs re-ingesting.** Two ingestion bugs were found and fixed. Paragraph boundaries were being silently destroyed before chunking ran, and every chunk was stored with the same position (`chunk_index` 0), so a source's text could read back, be edited, and reach voice calls out of order. Both fixes apply only to newly ingested content, and the lost order can't be recovered from the database. Delete and re-add any Knowledge Base entry added before these fixes.
 - **Automatic phone number provisioning** (a "Get a phone number" button for business owners) is not built. It requires a real billing/subscription system first — without one, provisioned numbers would be charged to the platform's own account with no way to bill the business owner. Deliberately out of scope for now.
 - **Voice channel conversation history has no length cap.** The text/chat channel trims history to the last 12 messages to keep response times consistent in long conversations; the voice channel doesn't yet do the equivalent (structurally more involved, since Pipecat maintains one running context object per call rather than rebuilding it each turn). Low priority in practice since real calls are naturally short.
 - **PII/consent for call recording is notice-only, not interactive consent.** Every call plays a fixed "this call may be recorded" notice before the greeting, but the call proceeds regardless of the caller's reaction. Whether this is sufficient depends on local regulations, which haven't been formally researched for every jurisdiction this might be deployed in.
