@@ -74,13 +74,14 @@ def ingest_text(db: Session, tenant_id: str, source_type: str, raw_text: str) ->
     text_chunks = chunk_text(cleaned)
 
     qdrant_chunks = []
-    for chunk in text_chunks:
+    for index, chunk in enumerate(text_chunks):
         doc_id = str(uuid.uuid4())
         db.add(Document(
             id=doc_id,
             source_id=source.id,
             tenant_id=tenant_id,
             chunk_text=chunk,
+            chunk_index=index,  # position within the source — the only thing that preserves original order, since ids are random UUIDs
         ))
         qdrant_chunks.append({"id": doc_id, "text": chunk, "metadata": {"source_id": source.id}})
 
