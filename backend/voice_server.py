@@ -21,23 +21,27 @@ Run with:
     uvicorn voice_server:app --reload --port 8001
 """
 
+import asyncio
 import json
 from fastapi import FastAPI, WebSocket, Request, Response, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config import settings
 from database import SessionLocal
-from models import Tenant, Conversation, Channel, Config, Document, KnowledgeSource
+from models import Tenant, Conversation, Channel, Config
 import auth
+import vector_store
 from call_logging import start_call_recording, save_transcript, close_conversation
 from agent import AGENT_TOOLS, _execute_tool, _format_settings
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import TTSSpeakFrame, TranscriptionFrame
+from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
@@ -79,22 +83,67 @@ def _get_tenant_by_phone(db: Session, phone_number: str) -> Tenant | None:
     return db.query(Tenant).filter(Tenant.phone_number == phone_number).first()
 
 
-def _knowledge_context(db: Session, tenant_id: str) -> str:
-    """
-    The tenant's knowledge base as one block of text, in reading order:
-    oldest source first, and each source's chunks in their original
-    sequence. Ordering by chunk_index alone would interleave sources
-    (every source's first chunk, then every source's second chunk...).
-    """
-    documents = (
-        db.query(Document)
-        .join(KnowledgeSource, Document.source_id == KnowledgeSource.id)
-        .filter(Document.tenant_id == tenant_id)
-        .order_by(KnowledgeSource.created_at, KnowledgeSource.id, Document.chunk_index)
-        .all()
+MAX_HISTORY_MESSAGES = 12  # same cap the text channel uses, for the same reason
+
+
+def _with_context(system_prompt: str, context_text: str) -> str:
+    """The call's system prompt, followed by whatever the caller's last question turned up."""
+    return (
+        f"{system_prompt}\n\nCONTEXT — from this business's knowledge base, "
+        f"looked up for what the caller just said:\n{context_text}"
     )
-    knowledge_context = "\n\n".join(d.chunk_text for d in documents)[:4000]
-    return knowledge_context or "(No knowledge base content added yet.)"
+
+
+def _trim_history(messages: list, limit: int) -> list:
+    """
+    The most recent `limit` messages, never starting on a tool result — a
+    reply to a tool call the model can no longer see is rejected by the API.
+    """
+    kept = messages[-limit:]
+    while kept and isinstance(kept[0], dict) and kept[0].get("role") == "tool":
+        kept = kept[1:]
+    return kept
+
+
+class KnowledgeLookup(FrameProcessor):
+    """
+    Looks up this business's knowledge base for each thing the caller says
+    and puts the results in front of the model — the retrieval the text
+    channel already does every turn.
+
+    A call used to paste the first 4,000 characters of the whole knowledge
+    base into the prompt once, at the start. Anything past that simply did
+    not exist to a phone caller, however relevant, and nothing was ever
+    chosen for the question actually asked. Rebuilding the system prompt
+    each turn also keeps the conversation from growing without limit.
+    """
+
+    def __init__(self, tenant_id: str, context: LLMContext, system_prompt: str):
+        super().__init__()
+        self._tenant_id = tenant_id
+        self._context = context
+        self._system_prompt = system_prompt
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text and frame.text.strip():
+            await self._refresh(frame.text)
+        await self.push_frame(frame, direction)
+
+    async def _refresh(self, question: str):
+        try:
+            # Embedding runs on the CPU and Qdrant is a network hop, so keep
+            # both off the event loop that's carrying live audio.
+            results = await asyncio.to_thread(vector_store.search, self._tenant_id, question, 4)
+        except Exception as e:  # retrieval must never take a live call down
+            logger.warning(f"Knowledge lookup failed, continuing without it: {e}")
+            return
+
+        context_text = "\n\n".join(f"- {r['text']}" for r in results) if results else "(No matching information found.)"
+        history = _trim_history(self._context.get_messages()[1:], MAX_HISTORY_MESSAGES)
+        self._context.set_messages(
+            [{"role": "system", "content": _with_context(self._system_prompt, context_text)}] + history
+        )
 
 
 async def run_receptionist(
@@ -126,13 +175,10 @@ async def run_receptionist(
     # text channel already does — previously this system prompt only
     # had tenant.name/vertical, meaning voice answers (and the
     # escalate-vs-say-honestly decision) were based on the LLM's own
-    # guesswork about the business, not its actual Settings/Knowledge
-    # Base. Fetched once at call start (not per-turn RAG, since this
-    # pipeline doesn't have a retrieval step between STT and LLM) —
-    # good enough to ground the whole call, and far better than none.
+    # guesswork about the business, not its actual Settings. The
+    # knowledge base is looked up per turn by KnowledgeLookup below.
     config = db.query(Config).filter(Config.tenant_id == tenant.id).first()
     settings_section = _format_settings(config)
-    knowledge_context = _knowledge_context(db, tenant.id)
 
     # The tools and the code that runs them are the text channel's own
     # (agent.py), so chat and voice can't drift apart. They had: voice kept
@@ -205,13 +251,12 @@ HARD RULES:
     as the reason, so the business owner has everything they need to
     follow up without re-contacting the customer. After escalating,
     always tell the caller clearly that a team member will contact
-    them shortly.
+    them shortly."""
 
-CONTEXT:
-{knowledge_context}
-"""
-
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}], tools=tools)
+    context = LLMContext(
+        messages=[{"role": "system", "content": _with_context(system_prompt, "(The caller hasn't asked anything yet.)")}],
+        tools=tools,
+    )
     # Voice activity detection belongs on the user aggregator in Pipecat
     # 1.x. It used to be passed in the transport params, which silently
     # ignore unknown fields — so calls ran with no VAD, which both turn
@@ -224,6 +269,7 @@ CONTEXT:
     pipeline = Pipeline([
         transport.input(),
         stt,
+        KnowledgeLookup(tenant.id, context, system_prompt),
         context_aggregator.user(),
         llm,
         tts,
