@@ -10,8 +10,10 @@ Run with:
 """
 
 import io
+import re
+import secrets
 import uuid
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -62,7 +64,22 @@ class CreateTenantRequest(BaseModel):
     vertical: str | None = None
 
 
-@app.post("/admin/tenants")
+def require_admin(x_admin_key: str = Header(default="")):
+    """
+    Guards platform-operator routes. Off unless ADMIN_API_KEY is set in
+    .env: these routes create businesses and hand out working API keys,
+    so an unset key must mean "no one", never "anyone".
+    """
+    if not settings.ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin routes are turned off. Set ADMIN_API_KEY in backend/.env to use them.",
+        )
+    if not secrets.compare_digest(x_admin_key, settings.ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid admin key.")
+
+
+@app.post("/admin/tenants", dependencies=[Depends(require_admin)])
 def create_tenant(req: CreateTenantRequest, db: Session = Depends(get_db)):
     """
     Creates a new tenant with a generated API key. Internal/admin use —
@@ -148,19 +165,23 @@ def chat(
 # ==================== Week 3: Browser calling ====================
 
 @app.get("/token")
-def token():
+def token(tenant: Tenant = Depends(get_current_tenant)):
     """
-    Issues a short-lived Access Token so a webpage can call a tenant's
-    receptionist over WebRTC (browser calling) — no phone number,
-    carrier, or IDD/verification restrictions involved. Uses the
+    Issues a short-lived Access Token so the embedded widget can call a
+    tenant's receptionist through Twilio browser calling. Uses the
     TwiML App whose Voice Request URL points at voice_server.py's
     /voice endpoint.
+
+    Requires the tenant's API key, like /chat: every token lets its
+    holder place calls billed to the platform's Twilio account, so it
+    must never be handed to anonymous callers. (The Test Sandbox no
+    longer uses this — it calls over WebRTC, see voice_server.py.)
     """
     access_token = AccessToken(
         settings.TWILIO_ACCOUNT_SID,
         settings.TWILIO_API_KEY_SID,
         settings.TWILIO_API_KEY_SECRET,
-        identity="browser_caller",
+        identity=f"widget-{tenant.id}",
     )
     voice_grant = VoiceGrant(
         outgoing_application_sid=settings.TWILIO_TWIML_APP_SID,
@@ -195,7 +216,28 @@ class UpdateSettingsRequest(BaseModel):
     services: list[str]
     booking_rules: dict
     persona: str
-    whatsapp_number: str | None = None  
+    whatsapp_number: str | None = None
+    phone_number: str | None = None  # left out = unchanged; "" or null = remove it
+
+
+def _normalize_phone_number(raw: str | None) -> str | None:
+    """
+    Returns the number in E.164 form (+14155551234) — exactly what Twilio
+    sends as the dialed number, which is how voice_server.py routes an
+    incoming call to a business. Spaces, dashes, dots and brackets are
+    dropped; an empty value means "no number".
+    """
+    if raw is None:
+        return None
+    cleaned = re.sub(r"[\s\-().]", "", raw)
+    if not cleaned:
+        return None
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter the phone number in international format: a + and the country code, e.g. +14155551234.",
+        )
+    return cleaned
 
 
 @app.post("/auth/signup")
@@ -474,12 +516,14 @@ def get_settings(user=Depends(auth.get_current_user), db: Session = Depends(get_
     # IMPORTANT:
     # Return settings whether the config was newly created
     # OR already existed.
+    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
     return {
         "hours": config.hours,
         "services": config.services,
         "booking_rules": config.booking_rules,
         "persona": config.persona,
         "whatsapp_number": config.whatsapp_number,
+        "phone_number": tenant.phone_number,
     }
 
 
@@ -489,6 +533,23 @@ def update_settings(
     user=Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
+    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+
+    # The phone number is how an incoming call finds this business, so it's
+    # checked before anything is saved — a bad number never half-saves the
+    # rest of the form.
+    if "phone_number" in req.model_fields_set:
+        phone_number = _normalize_phone_number(req.phone_number)
+        if phone_number and db.query(Tenant).filter(
+            Tenant.phone_number == phone_number,
+            Tenant.id != tenant.id,
+        ).first():
+            raise HTTPException(
+                status_code=409,
+                detail="That number is already connected to another business on this platform.",
+            )
+        tenant.phone_number = phone_number
+
     config = db.query(Config).filter(
         Config.tenant_id == user.tenant_id
     ).first()
@@ -516,6 +577,7 @@ def update_settings(
         "booking_rules": config.booking_rules,
         "persona": config.persona,
         "whatsapp_number": config.whatsapp_number,
+        "phone_number": tenant.phone_number,
     }
 
 

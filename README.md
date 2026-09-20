@@ -133,6 +133,7 @@ DATABASE_URL=postgresql://receptionist:<password>@localhost:5432/receptionist_pl
 QDRANT_URL=http://localhost:6333
 
 JWT_SECRET=<your-secret>
+ADMIN_API_KEY=                          # optional — turns on POST /admin/tenants; blank keeps it off
 
 GROQ_API_KEY=<your-key>
 GROQ_MODEL=<model-name>
@@ -319,7 +320,7 @@ docker exec receptionist_postgres psql -U receptionist -d receptionist_platform 
 - **Booking, lead capture, message-taking, escalation** — via tool-calling, with confirm-before-booking and confirm-before-escalating safety checks against speech/text mishearing
 - **WhatsApp escalation alerts** — business owners get an instant WhatsApp message when something is escalated (requires completing Twilio's WhatsApp Sandbox setup — see `backend/whatsapp.py`)
 - **Embeddable widget** — a small floating chat bubble any business can paste onto their own website (`Publish` page in the Admin Console generates the exact snippet)
-- **Phone calls** — real inbound calls via Twilio, resolved to the correct tenant by dialed number
+- **Phone calls** — real inbound calls via Twilio, routed to the right business by the dialed number, which each owner sets under **Settings → Phone Number**
 - **Free test calls** — talk to your receptionist from the Test Sandbox over WebRTC, through the same pipeline a phone caller reaches (see next section)
 - **Widget calling** — website visitors can call from the embedded widget, via Twilio browser calling
 
@@ -339,7 +340,7 @@ What it doesn't test: phone-network audio (8kHz, compressed) and carrier latency
 
 ### Widget calls (Twilio browser calling)
 
-The embeddable widget's **Call** tab uses Twilio's Voice SDK. It gets a token from `GET /token` on `main.py`, and Twilio then connects the call to `voice_server.py` through a TwiML App. This needs the Twilio browser-calling keys, and ngrok when running locally.
+The embeddable widget's **Call** tab uses Twilio's Voice SDK. It gets a token from `GET /token` on `main.py`, sending the business's API key (the same one it uses for chat), and Twilio then connects the call to `voice_server.py` through a TwiML App. This needs the Twilio browser-calling keys, and ngrok when running locally.
 
 **If you want to remove widget calling**, here is exactly what to delete or revert, file by file:
 
@@ -374,6 +375,7 @@ This section is intentionally honest about what's not finished, so anyone pickin
 - **Real inbound phone-call testing is not yet fully verified**, and **WhatsApp escalation alerts have not been live-tested**, because both require a working Twilio account with a purchased phone number (for calls) and a completed WhatsApp Sandbox/Business setup (for alerts) — this has been blocked by external Twilio account access issues during development (trial verification restrictions, and a suspected carrier-level call-blocking issue). The backend logic for both is complete and correct; what remains is Twilio account setup, not code.
 - **Some tenants' Knowledge Base content needs re-ingesting.** Two ingestion bugs were found and fixed. Paragraph boundaries were being silently destroyed before chunking ran, and every chunk was stored with the same position (`chunk_index` 0), so a source's text could read back, be edited, and reach voice calls out of order. Both fixes apply only to newly ingested content, and the lost order can't be recovered from the database. Delete and re-add any Knowledge Base entry added before these fixes.
 - **Automatic phone number provisioning** (a "Get a phone number" button for business owners) is not built. It requires a real billing/subscription system first — without one, provisioned numbers would be charged to the platform's own account with no way to bill the business owner. Deliberately out of scope for now.
+- **Phone numbers are self-declared.** An owner types their number into Settings. The platform checks that it's well formed and not used by another business, but not that the business owns it. A number only works if it belongs to the platform's Twilio account with its Voice webhook pointing at `/voice`. Fine for a pilot run by the platform operator; before open signups, number assignment should move to the operator or to provisioning.
 - **Voice channel conversation history has no length cap.** The text/chat channel trims history to the last 12 messages to keep response times consistent in long conversations; the voice channel doesn't yet do the equivalent (structurally more involved, since Pipecat maintains one running context object per call rather than rebuilding it each turn). Low priority in practice since real calls are naturally short.
 - **PII/consent for call recording is notice-only, not interactive consent.** Every call plays a fixed "this call may be recorded" notice before the greeting, but the call proceeds regardless of the caller's reaction. Whether this is sufficient depends on local regulations, which haven't been formally researched for every jurisdiction this might be deployed in.
 - **Voice latency has not been formally measured** (time-to-first-audio, turn-taking latency) — only judged informally during testing.

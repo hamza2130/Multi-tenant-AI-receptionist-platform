@@ -200,7 +200,8 @@ html, body {
 
   async function setupCalling() {
     try {
-      const res = await fetch(`${API_BASE}/token`);
+      const res = await fetch(`${API_BASE}/token`, { headers: { "X-API-Key": TENANT_API_KEY } });
+      if (!res.ok) throw new Error(`calling isn't available (error ${res.status})`);
       const data = await res.json();
       device = new Twilio.Device(data.token, { logLevel: 1 });
 

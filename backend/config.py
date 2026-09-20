@@ -19,6 +19,7 @@ class Settings(BaseSettings):
 
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
     JWT_SECRET: str = "change-this-to-a-real-random-secret-in-your-env-file"
+    ADMIN_API_KEY: str = ""  # turns on POST /admin/tenants (sent as X-Admin-Key); blank keeps it off
 
     # Voice pipeline (Week 2) — same services/keys as the voice receptionist project
     DEEPGRAM_API_KEY: str = ""

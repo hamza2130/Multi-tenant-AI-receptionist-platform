@@ -13,6 +13,7 @@ type Settings = {
   booking_rules: { advance_days: number; min_notice_hours: number };
   persona: string;
   whatsapp_number: string | null;
+  phone_number: string | null;
 };
 
 export default function SettingsPage() {
@@ -44,7 +45,11 @@ export default function SettingsPage() {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify(settings),
       });
-      if (!res.ok) throw new Error("Couldn't save — try again.");
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(typeof data.detail === "string" ? data.detail : "Couldn't save — try again.");
+      }
+      setSettings(await res.json()); // shows the phone number as stored, e.g. "+1 (415)…" becomes "+1415…"
       setMessage({ type: "success", text: "Saved. Your receptionist will use these details from now on." });
     } catch (err) {
       setMessage({ type: "error", text: err instanceof Error ? err.message : "Something went wrong." });
@@ -216,6 +221,25 @@ export default function SettingsPage() {
                 className="w-full border border-line rounded-md px-3 py-2 text-sm resize-none"
                 placeholder="e.g. A warm, reassuring receptionist for a family clinic."
               />
+            </section>
+
+            {/* Phone number */}
+            <section className="bg-white border border-line rounded-xl p-6">
+              <h2 className="font-display text-xl text-ink mb-4">Phone Number</h2>
+              <p className="text-sm text-ink-soft mb-3">
+                The Twilio number your customers call. Your receptionist answers every call to it, using
+                everything on this page.
+              </p>
+              <input
+                type="tel"
+                value={settings.phone_number ?? ""}
+                onChange={(e) => setSettings({ ...settings, phone_number: e.target.value })}
+                placeholder="e.g. +14155551234"
+                className="w-full border border-line rounded-md px-3 py-2 text-sm"
+              />
+              <p className="text-xs text-ink-soft/70 mt-1.5">
+                Include the + and country code. No number yet? You can still test calls from the Test Sandbox.
+              </p>
             </section>
 
             {/* WhatsApp alerts */}
