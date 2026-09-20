@@ -14,7 +14,7 @@ reaches the caller. This is the plan's "no raw tool-call output"
 guardrail.
 """
 
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from models import Config
 from sqlalchemy.orm import Session
 from models import Booking, Lead, Message
@@ -22,73 +22,131 @@ from zoneinfo import ZoneInfo
 TENANT_TIMEZONE = ZoneInfo("Asia/Karachi")
 from whatsapp import send_whatsapp_alert
 
-# In skills.py, replace the existing book_appointment() function with
-# this version — it now checks for a conflicting booking at the exact
-# same date/time for this tenant BEFORE creating a new one, instead of
-# blindly booking every request regardless of what's already taken.
+DEFAULT_APPOINTMENT_MINUTES = 30
 
-def _check_hours(db: Session, tenant_id: str, dt: datetime) -> str | None:
-    """
-    Checks the requested booking time against the tenant's actual
-    Settings (hours), deterministically in code — not left to the
-    LLM's own date/day-of-week reasoning, which can be wrong (as
-    observed: the model once said a date was "Sunday" and "closed",
-    then booked it anyway as "Saturday" in the same reply).
 
-    Returns an error message if the slot falls outside business
-    hours, or None if it's fine.
-    """
-    config = db.query(Config).filter(Config.tenant_id == tenant_id).first()
-    if not config or not config.hours:
-        return None  # no hours configured yet — don't block bookings
-
-    day_name = dt.strftime("%A").lower()  # e.g. "saturday" — computed by Python, not guessed by the LLM
-    day_hours = config.hours.get(day_name)
-    if not day_hours:
+def _number(value) -> float | None:
+    """A positive number from Settings, or None if it's missing or unusable."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
         return None
+    return number if number > 0 else None
+
+
+def _tidy(number: float) -> str:
+    """4.0 -> "4", 1.5 -> "1.5" — for reading a rule back to a caller."""
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+def _parse_time(value, fallback: str) -> time:
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except (TypeError, ValueError):
+        return datetime.strptime(fallback, "%H:%M").time()
+
+
+def _is_open_at(requested: time, opens: time, closes: time) -> bool:
+    """
+    Whether a time falls inside one day's opening window.
+
+    A closing time at or before the opening time means the day runs past
+    midnight — a restaurant open 12:00 to 00:00, or to 02:00 — so the window
+    is "opens until midnight" plus "midnight until closes". These used to be
+    compared as text, which made "19:30" greater than "00:00" and so turned
+    away every Friday and Saturday evening booking at a restaurant, the two
+    busiest nights of its week.
+    """
+    if opens == closes:
+        return True                       # open all day
+    if closes > opens:
+        return opens <= requested <= closes
+    return requested >= opens or requested <= closes
+
+
+def _check_booking_time(config: Config | None, dt: datetime) -> str | None:
+    """
+    Checks a requested slot against everything the business set in Settings:
+    that it hasn't already passed, gives enough notice, isn't too far ahead,
+    and falls on an open day and hour.
+
+    All of it is decided here in code, never left to the model's own
+    reasoning, which can be wrong (as observed: the model once called a date
+    "Sunday" and "closed", then booked it anyway as "Saturday" in the same
+    reply). Only hours were enforced before; notice and how-far-ahead were
+    described in the prompt and never actually checked.
+
+    Returns a sentence to say back to the caller, or None if the slot is fine.
+    """
+    now = datetime.now(TENANT_TIMEZONE)
+    if dt <= now:
+        return "That time has already passed — which day did you have in mind?"
+
+    rules = (config.booking_rules if config else None) or {}
+
+    notice_hours = _number(rules.get("min_notice_hours"))
+    if notice_hours and dt < now + timedelta(hours=notice_hours):
+        unit = "hour" if notice_hours == 1 else "hours"
+        return f"We need at least {_tidy(notice_hours)} {unit} of notice — could you pick a later time?"
+
+    advance_days = _number(rules.get("advance_days"))
+    if advance_days and dt > now + timedelta(days=advance_days):
+        unit = "day" if advance_days == 1 else "days"
+        return f"We can only book up to {_tidy(advance_days)} {unit} ahead — could you pick a nearer date?"
+
+    hours = (config.hours if config else None) or {}
+    day_hours = hours.get(dt.strftime("%A").lower())  # the day, computed by Python, not guessed by the model
+    if not day_hours:
+        return None  # no hours set for that day — don't block the booking
 
     if day_hours.get("closed"):
-        return f"We're closed on {day_name.capitalize()}s — could you pick a different day?"
+        return f"We're closed on {dt.strftime('%A')}s — could you pick a different day?"
 
-    requested_time = dt.strftime("%H:%M")
-    if requested_time < day_hours.get("open", "00:00") or requested_time > day_hours.get("close", "23:59"):
-        return f"That's outside our hours on {day_name.capitalize()} ({day_hours.get('open')}–{day_hours.get('close')}) — could you pick a different time?"
+    opens = _parse_time(day_hours.get("open"), "00:00")
+    closes = _parse_time(day_hours.get("close"), "23:59")
+    if not _is_open_at(dt.time(), opens, closes):
+        return (f"That's outside our hours on {dt.strftime('%A')} "
+                f"({day_hours.get('open')}–{day_hours.get('close')}) — could you pick a different time?")
 
     return None
 
 
- 
 def book_appointment(db: Session, tenant_id: str, conversation_id: str,
                       datetime_str: str, name: str, phone: str = "") -> dict:
     """
-    Books an appointment for this tenant only — now checks for a
-    conflicting booking at the same date/time first, so two callers
-    (or the same caller through two different channels) can't
-    silently double-book the same slot.
+    Books an appointment for this tenant only, once the requested slot has
+    passed every rule in Settings and doesn't run into a nearby appointment.
     """
     try:
-        dt_naive = datetime.fromisoformat(datetime_str)
-        dt = dt_naive.replace(tzinfo=TENANT_TIMEZONE)
-        hours_error = _check_hours(db, tenant_id, dt)
-        if hours_error:
-            return {"success": False, "message": hours_error}
-
+        dt = datetime.fromisoformat(datetime_str).replace(tzinfo=TENANT_TIMEZONE)
     except ValueError:
         return {"success": False, "message": "I didn't understand that date/time — could you repeat it?"}
 
- 
-    existing = db.query(Booking).filter(
+    config = db.query(Config).filter(Config.tenant_id == tenant_id).first()
+
+    problem = _check_booking_time(config, dt)
+    if problem:
+        return {"success": False, "message": problem}
+
+    # Appointments take time, so two of them clash whenever they start
+    # closer together than one appointment's length. Matching only identical
+    # start times let a 10:15 booking through while 10:00 was still running.
+    rules = (config.booking_rules if config else None) or {}
+    length = timedelta(minutes=_number(rules.get("appointment_minutes")) or DEFAULT_APPOINTMENT_MINUTES)
+    clash = db.query(Booking).filter(
         Booking.tenant_id == tenant_id,
-        Booking.datetime_value == dt,
+        Booking.datetime_value > dt - length,
+        Booking.datetime_value < dt + length,
     ).first()
- 
-    if existing:
-        existing_name = (existing.contact or {}).get("name", "another caller")
+
+    if clash:
+        # Never name the other caller: a stranger on the phone shouldn't
+        # learn who else has an appointment, which the old message told them.
         return {
             "success": False,
-            "message": f"That slot is already booked (for {existing_name}). Could you pick a different time?",
+            "message": "Sorry, we're already booked around then — could you pick a different time?",
         }
- 
+
     booking = Booking(
         tenant_id=tenant_id,
         conversation_id=conversation_id,
@@ -97,7 +155,7 @@ def book_appointment(db: Session, tenant_id: str, conversation_id: str,
     )
     db.add(booking)
     db.commit()
- 
+
     return {
         "success": True,
         "message": f"Booked for {name} on {dt.strftime('%B %d at %I:%M %p')}.",

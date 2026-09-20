@@ -10,7 +10,7 @@ type DayHours = { open: string; close: string; closed: boolean };
 type Settings = {
   hours: Record<Day, DayHours>;
   services: string[];
-  booking_rules: { advance_days: number; min_notice_hours: number };
+  booking_rules: { advance_days: number; min_notice_hours: number; appointment_minutes: number };
   persona: string;
   whatsapp_number: string | null;
   phone_number: string | null;
@@ -206,6 +206,23 @@ export default function SettingsPage() {
                       className="w-20 border border-line rounded-md px-2 py-1 text-sm text-right"
                     />
                     <span className="text-sm text-ink-soft">hours</span>
+                  </span>
+                </label>
+                <label className="flex items-center justify-between">
+                  <span className="text-sm text-ink-soft">
+                    How long is one appointment?
+                    <span className="block text-xs text-ink-soft/70">Two bookings this close together are treated as a clash.</span>
+                  </span>
+                  <span className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={5}
+                      step={5}
+                      value={settings.booking_rules.appointment_minutes ?? 30}
+                      onChange={(e) => setSettings({ ...settings, booking_rules: { ...settings.booking_rules, appointment_minutes: Number(e.target.value) } })}
+                      className="w-20 border border-line rounded-md px-2 py-1 text-sm text-right"
+                    />
+                    <span className="text-sm text-ink-soft">minutes</span>
                   </span>
                 </label>
               </div>

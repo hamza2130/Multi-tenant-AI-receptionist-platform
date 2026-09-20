@@ -31,7 +31,7 @@ TEMPLATES = {
             "Lab Tests",
             "Minor Procedures",
         ],
-        "booking_rules": {"advance_days": 30, "min_notice_hours": 4},
+        "booking_rules": {"advance_days": 30, "min_notice_hours": 4, "appointment_minutes": 30},
         "persona": (
             "A calm, professional, and reassuring medical receptionist. "
             "Speaks clearly and simply, never gives medical advice, and "
@@ -69,7 +69,7 @@ Please update this Knowledge Base with your clinic's real address, phone number,
             "Rental Listings",
             "Property Valuation",
         ],
-        "booking_rules": {"advance_days": 14, "min_notice_hours": 2},
+        "booking_rules": {"advance_days": 14, "min_notice_hours": 2, "appointment_minutes": 60},
         "persona": (
             "A friendly, knowledgeable, and proactive real estate assistant. "
             "Helps callers book property viewings and consultations, and "
@@ -103,7 +103,7 @@ Please update this Knowledge Base with your agency's real service areas, current
             "Private Events",
             "Delivery",
         ],
-        "booking_rules": {"advance_days": 21, "min_notice_hours": 1},
+        "booking_rules": {"advance_days": 21, "min_notice_hours": 1, "appointment_minutes": 90},
         "persona": (
             "A warm, welcoming host taking table reservations. Confirms "
             "party size, date, time, and a contact number for every "

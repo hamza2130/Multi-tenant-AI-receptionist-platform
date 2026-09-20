@@ -15,7 +15,7 @@ import secrets
 import uuid
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
@@ -24,7 +24,7 @@ from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 
 from database import get_db, init_db
-from models import Tenant, Conversation, Message, Channel, MessageRole, KnowledgeSource
+from models import Tenant, Conversation, Message, Channel, MessageRole, KnowledgeSource, SourceType
 from tenant_resolver import get_current_tenant
 from config import settings
 import ingestion
@@ -96,7 +96,7 @@ def create_tenant(req: CreateTenantRequest, db: Session = Depends(get_db)):
 # ==================== Week 1: Ingestion (API-key based) ====================
 
 class IngestTextRequest(BaseModel):
-    source_type: str  # "doc" | "url" | "faq"
+    source_type: SourceType  # doc | url | faq — an unknown value used to reach the database and 500 on the way back
     text: str
 
 
@@ -120,8 +120,19 @@ def ingest_text(
 # ==================== Week 1-2: Chat (widget / API-key based) ====================
 
 class ChatRequest(BaseModel):
-    message: str
+    # /chat is reachable by anyone with the widget key, which is public by
+    # design, and every message costs a paid LLM call — so cap the size and
+    # turn away messages with nothing in them.
+    message: str = Field(max_length=2000)
     conversation_id: str | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _must_say_something(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("Message can't be empty.")
+        return text
 
 
 @app.post("/chat")
@@ -504,6 +515,7 @@ def get_settings(user=Depends(auth.get_current_user), db: Session = Depends(get_
             booking_rules={
                 "advance_days": 30,
                 "min_notice_hours": 2,
+                "appointment_minutes": 30,
             },
             persona="A friendly, professional receptionist.",
             whatsapp_number=None,

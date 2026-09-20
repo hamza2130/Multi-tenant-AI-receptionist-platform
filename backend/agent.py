@@ -200,11 +200,29 @@ def _format_settings(config) -> str:
 Hours:
 {chr(10).join(hours_lines) if hours_lines else "  (not set)"}
 Services: {services}
-Booking rules: can book up to {rules.get('advance_days', 'N/A')} days ahead, minimum {rules.get('min_notice_hours', 'N/A')} hours notice.
+Booking rules: can book up to {rules.get('advance_days', 'N/A')} days ahead, minimum {rules.get('min_notice_hours', 'N/A')} hours notice, each appointment lasts about {rules.get('appointment_minutes', 30)} minutes.
 Persona: {config.persona or "A friendly, professional receptionist."}"""
 
 
+TOOL_ARGUMENTS_UNUSABLE = {
+    "success": False,
+    "message": "I didn't catch those details properly — could you go over them again?",
+}
+
+
 def _execute_tool(db: Session, tenant_id: str, conversation_id: str, name: str, args: dict) -> dict:
+    # Models sometimes call a tool with arguments that don't fit it. Hand the
+    # problem back as a tool result so the model can ask the caller again,
+    # rather than letting it raise and take down the whole turn.
+    if not isinstance(args, dict):
+        return TOOL_ARGUMENTS_UNUSABLE
+    try:
+        return _dispatch_tool(db, tenant_id, conversation_id, name, args)
+    except TypeError:
+        return TOOL_ARGUMENTS_UNUSABLE
+
+
+def _dispatch_tool(db: Session, tenant_id: str, conversation_id: str, name: str, args: dict) -> dict:
     if name == "book_appointment":
         return skills.book_appointment(db, tenant_id, conversation_id, **args)
     if name == "capture_lead":
@@ -268,8 +286,14 @@ def respond(db: Session, tenant, conversation_id: str, message: str, history: li
         })
 
         for tool_call in reply.tool_calls:
-            args = json.loads(tool_call.function.arguments)
-            result = _execute_tool(db, tenant.id, conversation_id, tool_call.function.name, args)
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                # An LLM emitting invalid JSON used to raise here and fail the
+                # request mid-conversation; now it's just a failed tool call.
+                result = TOOL_ARGUMENTS_UNUSABLE
+            else:
+                result = _execute_tool(db, tenant.id, conversation_id, tool_call.function.name, args)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
